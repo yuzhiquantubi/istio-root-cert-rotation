@@ -414,21 +414,42 @@ spec:
         command: ["/bin/sh", "-c"]
         args:
         - |
-          # Continuous connectivity test
+          # Continuous connectivity test with detailed error logging
           LOG_FILE=/shared/connectivity.log
+          RESP_FILE=/tmp/response.txt
           SUCCESS_COUNT=0
           FAIL_COUNT=0
           echo "Starting connectivity test at \$(date -Iseconds)" > \$LOG_FILE
           while true; do
             TIMESTAMP=\$(date -Iseconds)
-            RESPONSE=\$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 http://test-server:8080 2>&1)
-            if [ "\$RESPONSE" = "200" ]; then
+            # Capture response body, HTTP code, and timing info
+            HTTP_CODE=\$(curl -s -o \$RESP_FILE -w "%{http_code}" --connect-timeout 5 --max-time 10 http://test-server:8080 2>/tmp/curl_error.txt)
+            CURL_EXIT=\$?
+
+            if [ "\$HTTP_CODE" = "200" ] && [ "\$CURL_EXIT" -eq 0 ]; then
               SUCCESS_COUNT=\$((SUCCESS_COUNT + 1))
               echo "[\$TIMESTAMP] SUCCESS (total: \$SUCCESS_COUNT, failed: \$FAIL_COUNT)" >> \$LOG_FILE
             else
               FAIL_COUNT=\$((FAIL_COUNT + 1))
-              echo "[\$TIMESTAMP] FAILED - Response: \$RESPONSE (total: \$SUCCESS_COUNT, failed: \$FAIL_COUNT)" >> \$LOG_FILE
-              echo "[\$TIMESTAMP] FAILED - Response: \$RESPONSE" >&2
+              # Collect detailed error info
+              CURL_ERROR=""
+              RESP_BODY=""
+              if [ -s /tmp/curl_error.txt ]; then
+                CURL_ERROR=\$(cat /tmp/curl_error.txt | tr '\n' ' ')
+              fi
+              if [ -s \$RESP_FILE ]; then
+                RESP_BODY=\$(head -c 500 \$RESP_FILE | tr '\n' ' ')
+              fi
+              # Log detailed failure info
+              echo "[\$TIMESTAMP] FAILED - HTTP:\$HTTP_CODE curl_exit:\$CURL_EXIT (total: \$SUCCESS_COUNT, failed: \$FAIL_COUNT)" >> \$LOG_FILE
+              if [ -n "\$CURL_ERROR" ]; then
+                echo "  curl_error: \$CURL_ERROR" >> \$LOG_FILE
+              fi
+              if [ -n "\$RESP_BODY" ]; then
+                echo "  response: \$RESP_BODY" >> \$LOG_FILE
+              fi
+              # Also print to stderr for kubectl logs
+              echo "[\$TIMESTAMP] FAILED - HTTP:\$HTTP_CODE curl_exit:\$CURL_EXIT error:\$CURL_ERROR body:\$RESP_BODY" >&2
             fi
             # Keep only last 1000 lines
             tail -1000 \$LOG_FILE > \$LOG_FILE.tmp && mv \$LOG_FILE.tmp \$LOG_FILE 2>/dev/null || true
@@ -489,16 +510,20 @@ check_test_status() {
 
     # Show summary
     log_info "Connectivity summary:"
-    local total_success=$(kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -c "SUCCESS" /shared/connectivity.log 2>/dev/null || echo "0")
-    local total_fail=$(kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -c "FAILED" /shared/connectivity.log 2>/dev/null || echo "0")
+    local total_success=$(kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -c "^\[.*SUCCESS" /shared/connectivity.log 2>/dev/null | tr -d '[:space:]' || echo "0")
+    local total_fail=$(kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -c "^\[.*FAILED" /shared/connectivity.log 2>/dev/null | tr -d '[:space:]' || echo "0")
+
+    # Ensure we have valid numbers
+    total_success=${total_success:-0}
+    total_fail=${total_fail:-0}
 
     echo "  Total successful requests: $total_success"
     echo "  Total failed requests: $total_fail"
 
-    if [ "$total_fail" -gt 0 ]; then
+    if [ "$total_fail" -gt 0 ] 2>/dev/null; then
         echo ""
-        log_warning "Recent failures:"
-        kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep "FAILED" /shared/connectivity.log 2>/dev/null | tail -10
+        log_warning "Recent failures (with details):"
+        kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -A2 "^\[.*FAILED" /shared/connectivity.log 2>/dev/null | tail -15
     fi
 
     echo ""
