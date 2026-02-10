@@ -64,27 +64,20 @@ spec:
 # 2. Prepare certificates and backup current state
 ./istio-root-cert-rotation.sh prepare
 
-# 3. Reset test log and execute Phase 1
-./istio-root-cert-rotation.sh reset-test
+# 3. Execute Phase 1: Add new root to trust store
 ./istio-root-cert-rotation.sh phase1
+# Answer 'y' when prompted to run complete verification, or run manually:
+./istio-root-cert-rotation.sh verify-phase  # Tests OLD certs, restarts pods, tests NEW certs
 
-# 4. Monitor connectivity (in another terminal)
-./istio-root-cert-rotation.sh watch-test
-
-# 5. Check for any failures
-./istio-root-cert-rotation.sh test-status
-
-# 6. Execute Phase 2: Switch to new CA
-./istio-root-cert-rotation.sh reset-test
+# 4. Execute Phase 2: Switch to new CA for signing
 ./istio-root-cert-rotation.sh phase2
-./istio-root-cert-rotation.sh test-status
+./istio-root-cert-rotation.sh verify-phase  # Tests OLD certs (signed by A), restarts, tests NEW certs (signed by B)
 
-# 7. Execute Phase 3: Remove old root
-./istio-root-cert-rotation.sh reset-test
+# 5. Execute Phase 3: Remove old root
 ./istio-root-cert-rotation.sh phase3
-./istio-root-cert-rotation.sh test-status
+./istio-root-cert-rotation.sh verify-phase  # Final verification
 
-# 8. Cleanup test workloads
+# 6. Cleanup test workloads
 ./istio-root-cert-rotation.sh cleanup-test
 ```
 
@@ -110,6 +103,7 @@ spec:
 | `test-status` | Check test workload connectivity status and failure counts |
 | `watch-test` | Watch test connectivity in real-time |
 | `reset-test` | Reset connectivity log before a phase |
+| `verify-phase` | **Complete verification**: test OLD certs, rollout restart, test NEW certs |
 | `cleanup-test` | Remove test workloads |
 
 ### Environment Variables
@@ -192,6 +186,29 @@ The script includes test workloads to validate zero-downtime during certificate 
 - **mTLS connectivity**: Client and server communicate through Istio sidecars
 - **Certificate validation**: Both workloads use Istio-issued certificates
 - **Continuous monitoring**: Requests sent every second with success/failure logging
+
+### Complete Phase Verification (`verify-phase`)
+
+Each phase needs to verify **two scenarios** to ensure zero-downtime:
+
+1. **OLD certificate workloads** - Existing pods with old certificates still work
+2. **NEW certificate workloads** - After rollout restart, pods with new certificates also work
+
+The `verify-phase` command automates this:
+
+```
+Step 1: Test OLD certs     →  Existing pods communicate successfully
+           ↓
+Step 2: Rollout restart    →  Pods get new certificates from Istio
+           ↓
+Step 3: Test NEW certs     →  Restarted pods communicate successfully
+           ↓
+         PASS              →  Safe to proceed to next phase
+```
+
+This ensures the certificate rotation doesn't break either:
+- Existing workloads that haven't restarted yet
+- New workloads that receive updated certificates
 
 ### Test Output
 

@@ -587,6 +587,102 @@ reset_test_log() {
     log_success "Connectivity log reset"
 }
 
+# Verify phase with both old and new certificates
+# This function:
+# 1. Checks old workloads (with old certs) still work
+# 2. Rolls out restart to get new certificates
+# 3. Checks new workloads (with new certs) also work
+verify_phase_complete() {
+    local phase_name="${1:-current phase}"
+
+    log_info "=========================================="
+    log_info "Complete Verification for $phase_name"
+    log_info "=========================================="
+
+    if ! kubectl get namespace "$TEST_NAMESPACE" &> /dev/null; then
+        log_warning "Test namespace '$TEST_NAMESPACE' not found. Skipping test verification."
+        return 0
+    fi
+
+    # Step 1: Verify old workloads still work
+    log_info "Step 1: Verifying OLD certificate workloads still work..."
+    reset_test_log
+    log_info "Waiting 15 seconds to collect test results..."
+    sleep 15
+
+    local client_pod=$(kubectl get pod -n "$TEST_NAMESPACE" -l app=test-client -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    local old_fail=$(kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -c "^\[.*FAILED" /shared/connectivity.log 2>/dev/null | tr -d '[:space:]' || echo "0")
+    old_fail=${old_fail:-0}
+
+    if [ "$old_fail" -gt 0 ] 2>/dev/null; then
+        log_error "OLD certificate workloads have failures! ($old_fail failures)"
+        log_error "Recent failures:"
+        kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -A2 "^\[.*FAILED" /shared/connectivity.log 2>/dev/null | tail -15
+        return 1
+    else
+        log_success "OLD certificate workloads: OK (no failures)"
+    fi
+
+    # Show old certificate info
+    log_info "Current certificate (before restart):"
+    istioctl pc secret "$client_pod.$TEST_NAMESPACE" -ojson 2>/dev/null | \
+        jq -r '.dynamicActiveSecrets[0].secret.tlsCertificate.certificateChain.inlineBytes // empty' | \
+        base64 -d 2>/dev/null | \
+        step certificate inspect --short - 2>/dev/null | sed 's/^/  /' || \
+        echo "  Could not inspect certificate"
+
+    # Step 2: Rollout restart to get new certificates
+    log_info ""
+    log_info "Step 2: Rolling restart test workloads to get NEW certificates..."
+    kubectl rollout restart deployment/test-client deployment/test-server -n "$TEST_NAMESPACE"
+
+    log_info "Waiting for rollout to complete..."
+    kubectl rollout status deployment/test-client -n "$TEST_NAMESPACE" --timeout=120s
+    kubectl rollout status deployment/test-server -n "$TEST_NAMESPACE" --timeout=120s
+
+    # Wait for pods to be fully ready
+    log_info "Waiting for new pods to initialize..."
+    sleep 10
+
+    # Step 3: Verify new workloads work
+    log_info ""
+    log_info "Step 3: Verifying NEW certificate workloads work..."
+
+    # Get new client pod (after restart)
+    client_pod=$(kubectl get pod -n "$TEST_NAMESPACE" -l app=test-client -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+    # Show new certificate info
+    log_info "New certificate (after restart):"
+    istioctl pc secret "$client_pod.$TEST_NAMESPACE" -ojson 2>/dev/null | \
+        jq -r '.dynamicActiveSecrets[0].secret.tlsCertificate.certificateChain.inlineBytes // empty' | \
+        base64 -d 2>/dev/null | \
+        step certificate inspect --short - 2>/dev/null | sed 's/^/  /' || \
+        echo "  Could not inspect certificate"
+
+    # Reset and test
+    reset_test_log
+    log_info "Waiting 15 seconds to collect test results..."
+    sleep 15
+
+    local new_fail=$(kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -c "^\[.*FAILED" /shared/connectivity.log 2>/dev/null | tr -d '[:space:]' || echo "0")
+    new_fail=${new_fail:-0}
+
+    if [ "$new_fail" -gt 0 ] 2>/dev/null; then
+        log_error "NEW certificate workloads have failures! ($new_fail failures)"
+        log_error "Recent failures:"
+        kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -A2 "^\[.*FAILED" /shared/connectivity.log 2>/dev/null | tail -15
+        return 1
+    else
+        log_success "NEW certificate workloads: OK (no failures)"
+    fi
+
+    log_success "=========================================="
+    log_success "$phase_name verification PASSED"
+    log_success "Both OLD and NEW certificate workloads work correctly"
+    log_success "=========================================="
+    return 0
+}
+
 # Phase 1: Add Root B to trust store (still using Root A for signing)
 execute_phase1() {
     log_info "=========================================="
@@ -620,11 +716,23 @@ execute_phase1() {
     kubectl get secret cacerts -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['root-cert\.pem']}" | \
         base64 -d | step certificate inspect --short -
 
-    log_success "Phase 1 verification completed"
+    log_success "Phase 1 secret update completed"
     echo ""
-    log_warning "Monitor your workloads for any TLS errors before proceeding to Phase 2"
-    log_warning "Wait for at least one certificate rotation cycle (12 hours by default)"
-    log_warning "Or manually verify workload certificates have been updated"
+
+    # Verify both old and new certificate workloads
+    if kubectl get namespace "$TEST_NAMESPACE" &> /dev/null; then
+        echo ""
+        read -p "Run complete verification (test OLD and NEW certs)? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            verify_phase_complete "Phase 1"
+        fi
+    fi
+
+    echo ""
+    log_warning "If not running automatic verification, manually check:"
+    log_warning "1. Existing workloads still work (old certificates)"
+    log_warning "2. Restart some workloads and verify they also work (new certificates)"
 }
 
 # Phase 2: Switch to Root B for signing (maintain dual root trust)
@@ -660,10 +768,23 @@ execute_phase2() {
     log_info "Checking istiod logs for certificate reload..."
     kubectl logs -n "$ISTIO_NAMESPACE" deployment/istiod --tail=20 | grep -i "cert\|root\|ca" || true
 
-    log_success "Phase 2 verification completed"
+    log_success "Phase 2 secret update completed"
     echo ""
-    log_warning "Monitor your workloads for any TLS errors before proceeding to Phase 3"
-    log_warning "Wait for all workloads to receive new certificates signed by Root B"
+
+    # Verify both old and new certificate workloads
+    if kubectl get namespace "$TEST_NAMESPACE" &> /dev/null; then
+        echo ""
+        read -p "Run complete verification (test OLD and NEW certs)? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            verify_phase_complete "Phase 2"
+        fi
+    fi
+
+    echo ""
+    log_warning "If not running automatic verification, manually check:"
+    log_warning "1. Existing workloads still work (old certificates signed by Root A)"
+    log_warning "2. Restart some workloads and verify they also work (new certificates signed by Root B)"
 }
 
 # Phase 3: Remove Root A from trust store
@@ -696,7 +817,24 @@ execute_phase3() {
     kubectl get secret cacerts -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['root-cert\.pem']}" | \
         base64 -d | step certificate inspect --short -
 
+    log_success "Phase 3 secret update completed"
+    echo ""
+
+    # Verify both old and new certificate workloads
+    if kubectl get namespace "$TEST_NAMESPACE" &> /dev/null; then
+        echo ""
+        read -p "Run complete verification (test OLD and NEW certs)? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            verify_phase_complete "Phase 3 (Final)"
+        fi
+    fi
+
+    echo ""
+    log_success "=========================================="
     log_success "Certificate rotation completed successfully!"
+    log_success "=========================================="
+    log_info "All workloads should now be using Root B certificates"
 }
 
 # Rollback to original state
@@ -743,6 +881,7 @@ usage() {
     echo "  test-status   - Check test workload connectivity status"
     echo "  watch-test    - Watch test connectivity in real-time"
     echo "  reset-test    - Reset connectivity log before a phase"
+    echo "  verify-phase  - Verify OLD and NEW certs both work (with rollout restart)"
     echo "  cleanup-test  - Remove test workloads"
     echo ""
     echo "Environment Variables:"
@@ -752,16 +891,15 @@ usage() {
     echo "  CERT_VALIDITY_DAYS    - Root CA validity in days (default: 3650)"
     echo ""
     echo "Example workflow:"
-    echo "  1. $0 deploy-test  # Deploy test workloads"
-    echo "  2. $0 prepare      # Prepare certificates and backup"
-    echo "  3. $0 reset-test   # Reset connectivity log"
-    echo "  4. $0 phase1       # Add new root to trust store"
-    echo "  5. $0 test-status  # Check for any failures"
-    echo "  6. # Wait and monitor with: $0 watch-test"
-    echo "  7. $0 phase2       # Switch to new CA"
-    echo "  8. $0 test-status  # Check for any failures"
-    echo "  9. $0 phase3       # Remove old root"
-    echo " 10. $0 cleanup-test # Remove test workloads"
+    echo "  1. $0 deploy-test   # Deploy test workloads"
+    echo "  2. $0 prepare       # Prepare certificates and backup"
+    echo "  3. $0 phase1        # Add new root to trust store"
+    echo "  4. $0 verify-phase  # Test OLD certs work, restart, test NEW certs work"
+    echo "  5. $0 phase2        # Switch to new CA"
+    echo "  6. $0 verify-phase  # Test OLD certs work, restart, test NEW certs work"
+    echo "  7. $0 phase3        # Remove old root"
+    echo "  8. $0 verify-phase  # Final verification"
+    echo "  9. $0 cleanup-test  # Remove test workloads"
 }
 
 # Prepare certificates
@@ -894,6 +1032,9 @@ case "${1:-}" in
         ;;
     reset-test)
         reset_test_log
+        ;;
+    verify-phase)
+        verify_phase_complete "Manual verification"
         ;;
     cleanup-test)
         cleanup_test_workloads
