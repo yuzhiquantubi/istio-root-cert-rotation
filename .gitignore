@@ -1,0 +1,21 @@
+# Certificate workspace (contains sensitive keys)
+cert-rotation-workspace/
+
+# Generated certificates
+*.pem
+*.csr
+*.srl
+
+# Backup files
+backup/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
