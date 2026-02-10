@@ -58,25 +58,39 @@ spec:
 ### Quick Start
 
 ```bash
-# 1. Prepare certificates and backup current state
+# 1. Deploy test workloads to monitor connectivity during rotation
+./istio-root-cert-rotation.sh deploy-test
+
+# 2. Prepare certificates and backup current state
 ./istio-root-cert-rotation.sh prepare
 
-# 2. Execute Phase 1: Add new root to trust store
+# 3. Reset test log and execute Phase 1
+./istio-root-cert-rotation.sh reset-test
 ./istio-root-cert-rotation.sh phase1
 
-# 3. Wait for certificate propagation (12-24 hours recommended)
-#    Monitor for any TLS errors
+# 4. Monitor connectivity (in another terminal)
+./istio-root-cert-rotation.sh watch-test
 
-# 4. Execute Phase 2: Switch to new CA
+# 5. Check for any failures
+./istio-root-cert-rotation.sh test-status
+
+# 6. Execute Phase 2: Switch to new CA
+./istio-root-cert-rotation.sh reset-test
 ./istio-root-cert-rotation.sh phase2
+./istio-root-cert-rotation.sh test-status
 
-# 5. Wait for all workloads to get new certificates
-
-# 6. Execute Phase 3: Remove old root
+# 7. Execute Phase 3: Remove old root
+./istio-root-cert-rotation.sh reset-test
 ./istio-root-cert-rotation.sh phase3
+./istio-root-cert-rotation.sh test-status
+
+# 8. Cleanup test workloads
+./istio-root-cert-rotation.sh cleanup-test
 ```
 
 ### All Commands
+
+#### Certificate Rotation Commands
 
 | Command | Description |
 |---------|-------------|
@@ -88,12 +102,23 @@ spec:
 | `rollback` | Rollback to original CA state |
 | `all` | Execute all phases interactively |
 
+#### Test Workload Commands
+
+| Command | Description |
+|---------|-------------|
+| `deploy-test` | Deploy test client/server workloads for connectivity testing |
+| `test-status` | Check test workload connectivity status and failure counts |
+| `watch-test` | Watch test connectivity in real-time |
+| `reset-test` | Reset connectivity log before a phase |
+| `cleanup-test` | Remove test workloads |
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WORK_DIR` | `./cert-rotation-workspace` | Working directory for certificates |
 | `ISTIO_NAMESPACE` | `istio-system` | Istio control plane namespace |
+| `TEST_NAMESPACE` | `cert-rotation-test` | Test workload namespace |
 | `CERT_VALIDITY_DAYS` | `3650` | Root CA validity (10 years) |
 | `INTERMEDIATE_VALIDITY_DAYS` | `365` | Intermediate CA validity (1 year) |
 
@@ -139,6 +164,64 @@ Before Phase 3:                    After Phase 3:
 
 - All workloads now use Root B certificates
 - Safe to remove Root A from trust store
+
+## Test Workloads
+
+The script includes test workloads to validate zero-downtime during certificate rotation:
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  cert-rotation-test namespace               │
+│                                                             │
+│   ┌─────────────┐         HTTP/mTLS        ┌─────────────┐  │
+│   │ test-client │ ───────────────────────> │ test-server │  │
+│   │  (1 replica)│    every 1 second        │ (2 replicas)│  │
+│   └─────────────┘                          └─────────────┘  │
+│         │                                                   │
+│         │ writes to                                         │
+│         ▼                                                   │
+│   /shared/connectivity.log (emptyDir volume)                │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### What Gets Tested
+
+- **mTLS connectivity**: Client and server communicate through Istio sidecars
+- **Certificate validation**: Both workloads use Istio-issued certificates
+- **Continuous monitoring**: Requests sent every second with success/failure logging
+
+### Test Output
+
+```bash
+$ ./istio-root-cert-rotation.sh test-status
+
+[INFO] Connectivity summary:
+  Total successful requests: 1234
+  Total failed requests: 0
+
+[INFO] Test workload certificate info:
+  test-client (test-client-xxx):
+    X.509v3 Certificate (ECDSA P-256) [Serial: 1234...]
+      Subject:     spiffe://cluster.local/ns/cert-rotation-test/sa/default
+      Issuer:      O=Istio,CN=Intermediate CA
+      Valid from:  2024-01-15T10:00:00Z
+              to:  2024-01-16T10:00:00Z
+```
+
+### Volume Configuration
+
+Both workloads include an `emptyDir` volume named `share`:
+
+```yaml
+volumes:
+- name: share
+  emptyDir: {}
+```
+
+This is used for storing connectivity logs that persist across container restarts.
 
 ## Verification Commands
 
