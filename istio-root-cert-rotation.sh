@@ -886,8 +886,11 @@ rollback() {
     log_warning "=========================================="
 
     if [ -f "$WORK_DIR/backup/cacerts.yaml" ]; then
-        log_info "Restoring cacerts secret..."
-        kubectl apply -f "$WORK_DIR/backup/cacerts.yaml"
+        log_info "Restoring cacerts secret from backup..."
+        # Delete and recreate to avoid resourceVersion conflicts
+        kubectl delete secret cacerts -n "$ISTIO_NAMESPACE" --ignore-not-found
+        # Remove resourceVersion and other metadata that would cause conflicts
+        grep -v "resourceVersion\|uid\|creationTimestamp\|selfLink" "$WORK_DIR/backup/cacerts.yaml" | kubectl apply -f -
         log_success "Restored cacerts secret"
     elif [ -f "$WORK_DIR/backup/istio-ca-secret.yaml" ]; then
         log_info "Removing cacerts and restoring self-signed CA..."
@@ -903,6 +906,10 @@ rollback() {
     kubectl rollout status deployment/istiod -n "$ISTIO_NAMESPACE"
 
     log_success "Rollback completed"
+    log_warning ""
+    log_warning "NOTE: This is a hard rollback. Workloads with new certificates"
+    log_warning "may experience temporary connection issues until they get new certs."
+    log_warning "Consider running: $0 verify-phase  to verify connectivity."
 }
 
 # Print usage
