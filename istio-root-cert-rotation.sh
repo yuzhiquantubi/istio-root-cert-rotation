@@ -341,7 +341,7 @@ metadata:
   name: test-server
   namespace: $TEST_NAMESPACE
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: test-server
@@ -587,98 +587,140 @@ reset_test_log() {
     log_success "Connectivity log reset"
 }
 
-# Verify phase with both old and new certificates
-# This function:
-# 1. Checks old workloads (with old certs) still work
-# 2. Rolls out restart to get new certificates
-# 3. Checks new workloads (with new certs) also work
+# Verify phase with all certificate combinations
+# This function tests all scenarios that happen during rotation:
+# 1. client(old) → server(old) - Both have old certificates
+# 2. client(new) → server(old) - Client restarted first (mixed)
+# 3. client(new) → server(new) - Both have new certificates
 verify_phase_complete() {
     local phase_name="${1:-current phase}"
+    local test_wait="${2:-10}"  # seconds to wait for test results
 
     log_info "=========================================="
     log_info "Complete Verification for $phase_name"
     log_info "=========================================="
+    log_info "Testing all certificate combinations:"
+    log_info "  1. client(OLD) → server(OLD)"
+    log_info "  2. client(NEW) → server(OLD)  [mixed]"
+    log_info "  3. client(NEW) → server(NEW)"
+    echo ""
 
     if ! kubectl get namespace "$TEST_NAMESPACE" &> /dev/null; then
         log_warning "Test namespace '$TEST_NAMESPACE' not found. Skipping test verification."
         return 0
     fi
 
-    # Step 1: Verify old workloads still work
-    log_info "Step 1: Verifying OLD certificate workloads still work..."
-    reset_test_log
-    log_info "Waiting 15 seconds to collect test results..."
-    sleep 15
+    # Helper function to check failures
+    check_failures() {
+        local pod="$1"
+        local scenario="$2"
+        local fail_count=$(kubectl exec -n "$TEST_NAMESPACE" "$pod" -c client -- grep -c "^\[.*FAILED" /shared/connectivity.log 2>/dev/null | tr -d '[:space:]' || echo "0")
+        fail_count=${fail_count:-0}
+
+        if [ "$fail_count" -gt 0 ] 2>/dev/null; then
+            log_error "$scenario: FAILED ($fail_count failures)"
+            kubectl exec -n "$TEST_NAMESPACE" "$pod" -c client -- grep -A2 "^\[.*FAILED" /shared/connectivity.log 2>/dev/null | tail -10
+            return 1
+        else
+            log_success "$scenario: OK"
+            return 0
+        fi
+    }
+
+    # Helper function to show certificate info
+    show_cert_info() {
+        local pod="$1"
+        local label="$2"
+        echo "  $label:"
+        istioctl pc secret "$pod.$TEST_NAMESPACE" -ojson 2>/dev/null | \
+            jq -r '.dynamicActiveSecrets[0].secret.tlsCertificate.certificateChain.inlineBytes // empty' | \
+            base64 -d 2>/dev/null | \
+            step certificate inspect --short - 2>/dev/null | sed 's/^/    /' || \
+            echo "    Could not inspect certificate"
+    }
+
+    # =========================================
+    # Step 1: client(OLD) → server(OLD)
+    # =========================================
+    log_info "Step 1: Testing client(OLD) → server(OLD)..."
 
     local client_pod=$(kubectl get pod -n "$TEST_NAMESPACE" -l app=test-client -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-    local old_fail=$(kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -c "^\[.*FAILED" /shared/connectivity.log 2>/dev/null | tr -d '[:space:]' || echo "0")
-    old_fail=${old_fail:-0}
+    local server_pod=$(kubectl get pod -n "$TEST_NAMESPACE" -l app=test-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 
-    if [ "$old_fail" -gt 0 ] 2>/dev/null; then
-        log_error "OLD certificate workloads have failures! ($old_fail failures)"
-        log_error "Recent failures:"
-        kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -A2 "^\[.*FAILED" /shared/connectivity.log 2>/dev/null | tail -15
+    log_info "Current certificates:"
+    show_cert_info "$client_pod" "test-client"
+    show_cert_info "$server_pod" "test-server"
+
+    reset_test_log
+    log_info "Waiting ${test_wait} seconds to collect test results..."
+    sleep "$test_wait"
+
+    if ! check_failures "$client_pod" "client(OLD) → server(OLD)"; then
         return 1
-    else
-        log_success "OLD certificate workloads: OK (no failures)"
     fi
 
-    # Show old certificate info
-    log_info "Current certificate (before restart):"
-    istioctl pc secret "$client_pod.$TEST_NAMESPACE" -ojson 2>/dev/null | \
-        jq -r '.dynamicActiveSecrets[0].secret.tlsCertificate.certificateChain.inlineBytes // empty' | \
-        base64 -d 2>/dev/null | \
-        step certificate inspect --short - 2>/dev/null | sed 's/^/  /' || \
-        echo "  Could not inspect certificate"
-
-    # Step 2: Rollout restart to get new certificates
+    # =========================================
+    # Step 2: client(NEW) → server(OLD)
+    # =========================================
     log_info ""
-    log_info "Step 2: Rolling restart test workloads to get NEW certificates..."
-    kubectl rollout restart deployment/test-client deployment/test-server -n "$TEST_NAMESPACE"
-
-    log_info "Waiting for rollout to complete..."
+    log_info "Step 2: Restarting ONLY test-client to get NEW certificate..."
+    kubectl rollout restart deployment/test-client -n "$TEST_NAMESPACE"
     kubectl rollout status deployment/test-client -n "$TEST_NAMESPACE" --timeout=120s
-    kubectl rollout status deployment/test-server -n "$TEST_NAMESPACE" --timeout=120s
 
-    # Wait for pods to be fully ready
-    log_info "Waiting for new pods to initialize..."
+    log_info "Waiting for client pod to initialize..."
     sleep 10
 
-    # Step 3: Verify new workloads work
-    log_info ""
-    log_info "Step 3: Verifying NEW certificate workloads work..."
-
-    # Get new client pod (after restart)
+    # Get new client pod
     client_pod=$(kubectl get pod -n "$TEST_NAMESPACE" -l app=test-client -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 
-    # Show new certificate info
-    log_info "New certificate (after restart):"
-    istioctl pc secret "$client_pod.$TEST_NAMESPACE" -ojson 2>/dev/null | \
-        jq -r '.dynamicActiveSecrets[0].secret.tlsCertificate.certificateChain.inlineBytes // empty' | \
-        base64 -d 2>/dev/null | \
-        step certificate inspect --short - 2>/dev/null | sed 's/^/  /' || \
-        echo "  Could not inspect certificate"
+    log_info "Current certificates (client restarted, server unchanged):"
+    show_cert_info "$client_pod" "test-client (NEW)"
+    show_cert_info "$server_pod" "test-server (OLD)"
 
-    # Reset and test
     reset_test_log
-    log_info "Waiting 15 seconds to collect test results..."
-    sleep 15
+    log_info "Waiting ${test_wait} seconds to collect test results..."
+    sleep "$test_wait"
 
-    local new_fail=$(kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -c "^\[.*FAILED" /shared/connectivity.log 2>/dev/null | tr -d '[:space:]' || echo "0")
-    new_fail=${new_fail:-0}
-
-    if [ "$new_fail" -gt 0 ] 2>/dev/null; then
-        log_error "NEW certificate workloads have failures! ($new_fail failures)"
-        log_error "Recent failures:"
-        kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -A2 "^\[.*FAILED" /shared/connectivity.log 2>/dev/null | tail -15
+    if ! check_failures "$client_pod" "client(NEW) → server(OLD)"; then
         return 1
-    else
-        log_success "NEW certificate workloads: OK (no failures)"
     fi
 
+    # =========================================
+    # Step 3: client(NEW) → server(NEW)
+    # =========================================
+    log_info ""
+    log_info "Step 3: Restarting test-server to get NEW certificate..."
+    kubectl rollout restart deployment/test-server -n "$TEST_NAMESPACE"
+    kubectl rollout status deployment/test-server -n "$TEST_NAMESPACE" --timeout=120s
+
+    log_info "Waiting for server pods to initialize..."
+    sleep 10
+
+    # Get new server pod
+    server_pod=$(kubectl get pod -n "$TEST_NAMESPACE" -l app=test-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+    log_info "Current certificates (both restarted):"
+    show_cert_info "$client_pod" "test-client (NEW)"
+    show_cert_info "$server_pod" "test-server (NEW)"
+
+    reset_test_log
+    log_info "Waiting ${test_wait} seconds to collect test results..."
+    sleep "$test_wait"
+
+    if ! check_failures "$client_pod" "client(NEW) → server(NEW)"; then
+        return 1
+    fi
+
+    # =========================================
+    # Summary
+    # =========================================
+    echo ""
     log_success "=========================================="
     log_success "$phase_name verification PASSED"
-    log_success "Both OLD and NEW certificate workloads work correctly"
+    log_success "All certificate combinations work correctly:"
+    log_success "  ✓ client(OLD) → server(OLD)"
+    log_success "  ✓ client(NEW) → server(OLD)"
+    log_success "  ✓ client(NEW) → server(NEW)"
     log_success "=========================================="
     return 0
 }

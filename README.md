@@ -189,26 +189,34 @@ The script includes test workloads to validate zero-downtime during certificate 
 
 ### Complete Phase Verification (`verify-phase`)
 
-Each phase needs to verify **two scenarios** to ensure zero-downtime:
+Each phase needs to verify **all certificate combinations** to ensure zero-downtime:
 
-1. **OLD certificate workloads** - Existing pods with old certificates still work
-2. **NEW certificate workloads** - After rollout restart, pods with new certificates also work
+| Step | Client | Server | Scenario |
+|------|--------|--------|----------|
+| 1 | OLD | OLD | Both pods have old certificates |
+| 2 | NEW | OLD | Client restarted first (mixed) |
+| 3 | NEW | NEW | Both pods have new certificates |
 
 The `verify-phase` command automates this:
 
 ```
-Step 1: Test OLD certs     →  Existing pods communicate successfully
-           ↓
-Step 2: Rollout restart    →  Pods get new certificates from Istio
-           ↓
-Step 3: Test NEW certs     →  Restarted pods communicate successfully
-           ↓
-         PASS              →  Safe to proceed to next phase
+Step 1: client(OLD) → server(OLD)    →  Test existing pods
+              ↓
+Step 2: Restart client only
+              ↓
+        client(NEW) → server(OLD)    →  Test mixed scenario
+              ↓
+Step 3: Restart server
+              ↓
+        client(NEW) → server(NEW)    →  Test fully rotated
+              ↓
+            PASS                     →  Safe to proceed
 ```
 
-This ensures the certificate rotation doesn't break either:
+This ensures the certificate rotation doesn't break:
 - Existing workloads that haven't restarted yet
-- New workloads that receive updated certificates
+- Mixed scenarios where pods restart at different times
+- Fully rotated workloads with new certificates
 
 ### Test Output
 
