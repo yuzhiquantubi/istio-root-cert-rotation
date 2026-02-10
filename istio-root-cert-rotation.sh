@@ -29,6 +29,7 @@ NC='\033[0m' # No Color
 # Configuration
 WORK_DIR="${WORK_DIR:-./cert-rotation-workspace}"
 ISTIO_NAMESPACE="${ISTIO_NAMESPACE:-istio-system}"
+TEST_NAMESPACE="${TEST_NAMESPACE:-cert-rotation-test}"
 CERT_VALIDITY_DAYS="${CERT_VALIDITY_DAYS:-3650}"  # 10 years for root CA
 INTERMEDIATE_VALIDITY_DAYS="${INTERMEDIATE_VALIDITY_DAYS:-365}"  # 1 year for intermediate
 
@@ -309,6 +310,245 @@ check_traffic_health() {
     istioctl x es "$pod.$namespace" -oprom 2>/dev/null | grep "istio_requests_total" | head -5 || log_warning "No metrics available"
 }
 
+# Deploy test workloads for certificate rotation testing
+deploy_test_workloads() {
+    log_info "Deploying test workloads for certificate rotation testing..."
+
+    # Create test namespace with Istio injection enabled
+    kubectl create namespace "$TEST_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+    kubectl label namespace "$TEST_NAMESPACE" istio-injection=enabled --overwrite
+
+    # Deploy server workload
+    log_info "Deploying test server..."
+    cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-server
+  namespace: $TEST_NAMESPACE
+  labels:
+    app: test-server
+spec:
+  ports:
+  - port: 8080
+    name: http
+  selector:
+    app: test-server
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-server
+  namespace: $TEST_NAMESPACE
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: test-server
+  template:
+    metadata:
+      labels:
+        app: test-server
+    spec:
+      containers:
+      - name: server
+        image: curlimages/curl:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          # Simple HTTP server using netcat
+          while true; do
+            echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nServer: \$(hostname)\nTime: \$(date -Iseconds)\nStatus: OK" | nc -l -p 8080 -q 1 2>/dev/null || true
+          done
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: share
+          mountPath: /shared
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+      volumes:
+      - name: share
+        emptyDir: {}
+EOF
+
+    # Deploy client workload that continuously tests connectivity
+    log_info "Deploying test client..."
+    cat <<EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-client
+  namespace: $TEST_NAMESPACE
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-client
+  template:
+    metadata:
+      labels:
+        app: test-client
+    spec:
+      containers:
+      - name: client
+        image: curlimages/curl:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          # Continuous connectivity test
+          LOG_FILE=/shared/connectivity.log
+          SUCCESS_COUNT=0
+          FAIL_COUNT=0
+          echo "Starting connectivity test at \$(date -Iseconds)" > \$LOG_FILE
+          while true; do
+            TIMESTAMP=\$(date -Iseconds)
+            RESPONSE=\$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 http://test-server:8080 2>&1)
+            if [ "\$RESPONSE" = "200" ]; then
+              SUCCESS_COUNT=\$((SUCCESS_COUNT + 1))
+              echo "[\$TIMESTAMP] SUCCESS (total: \$SUCCESS_COUNT, failed: \$FAIL_COUNT)" >> \$LOG_FILE
+            else
+              FAIL_COUNT=\$((FAIL_COUNT + 1))
+              echo "[\$TIMESTAMP] FAILED - Response: \$RESPONSE (total: \$SUCCESS_COUNT, failed: \$FAIL_COUNT)" >> \$LOG_FILE
+              echo "[\$TIMESTAMP] FAILED - Response: \$RESPONSE" >&2
+            fi
+            # Keep only last 1000 lines
+            tail -1000 \$LOG_FILE > \$LOG_FILE.tmp && mv \$LOG_FILE.tmp \$LOG_FILE 2>/dev/null || true
+            sleep 1
+          done
+        volumeMounts:
+        - name: share
+          mountPath: /shared
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+      volumes:
+      - name: share
+        emptyDir: {}
+EOF
+
+    log_info "Waiting for test workloads to be ready..."
+    kubectl rollout status deployment/test-server -n "$TEST_NAMESPACE" --timeout=120s
+    kubectl rollout status deployment/test-client -n "$TEST_NAMESPACE" --timeout=120s
+
+    log_success "Test workloads deployed successfully"
+    log_info "Client is continuously testing connectivity to server"
+    log_info "Use '$0 test-status' to check connectivity status"
+}
+
+# Check test workload connectivity status
+check_test_status() {
+    log_info "=========================================="
+    log_info "Test Workload Connectivity Status"
+    log_info "=========================================="
+
+    if ! kubectl get namespace "$TEST_NAMESPACE" &> /dev/null; then
+        log_error "Test namespace '$TEST_NAMESPACE' not found. Run '$0 deploy-test' first."
+        exit 1
+    fi
+
+    # Get client pod
+    local client_pod=$(kubectl get pod -n "$TEST_NAMESPACE" -l app=test-client -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+    if [ -z "$client_pod" ]; then
+        log_error "Test client pod not found"
+        exit 1
+    fi
+
+    log_info "Client pod: $client_pod"
+    echo ""
+
+    # Show recent connectivity log
+    log_info "Recent connectivity results (last 20 entries):"
+    kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- tail -20 /shared/connectivity.log 2>/dev/null || \
+        log_warning "Could not read connectivity log"
+
+    echo ""
+
+    # Show summary
+    log_info "Connectivity summary:"
+    local total_success=$(kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -c "SUCCESS" /shared/connectivity.log 2>/dev/null || echo "0")
+    local total_fail=$(kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep -c "FAILED" /shared/connectivity.log 2>/dev/null || echo "0")
+
+    echo "  Total successful requests: $total_success"
+    echo "  Total failed requests: $total_fail"
+
+    if [ "$total_fail" -gt 0 ]; then
+        echo ""
+        log_warning "Recent failures:"
+        kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- grep "FAILED" /shared/connectivity.log 2>/dev/null | tail -10
+    fi
+
+    echo ""
+
+    # Check workload certificates
+    log_info "Test workload certificate info:"
+    for app in test-client test-server; do
+        local pod=$(kubectl get pod -n "$TEST_NAMESPACE" -l app=$app -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$pod" ]; then
+            echo "  $app ($pod):"
+            istioctl pc secret "$pod.$TEST_NAMESPACE" -ojson 2>/dev/null | \
+                jq -r '.dynamicActiveSecrets[0].secret.tlsCertificate.certificateChain.inlineBytes // empty' | \
+                base64 -d 2>/dev/null | \
+                step certificate inspect --short - 2>/dev/null | sed 's/^/    /' || \
+                echo "    Could not inspect certificate"
+        fi
+    done
+}
+
+# Watch test connectivity in real-time
+watch_test() {
+    log_info "Watching test connectivity in real-time (Ctrl+C to stop)..."
+
+    if ! kubectl get namespace "$TEST_NAMESPACE" &> /dev/null; then
+        log_error "Test namespace '$TEST_NAMESPACE' not found. Run '$0 deploy-test' first."
+        exit 1
+    fi
+
+    local client_pod=$(kubectl get pod -n "$TEST_NAMESPACE" -l app=test-client -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+    if [ -z "$client_pod" ]; then
+        log_error "Test client pod not found"
+        exit 1
+    fi
+
+    kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- tail -f /shared/connectivity.log
+}
+
+# Clean up test workloads
+cleanup_test_workloads() {
+    log_info "Cleaning up test workloads..."
+
+    kubectl delete namespace "$TEST_NAMESPACE" --ignore-not-found --wait=false
+
+    log_success "Test workloads cleanup initiated"
+}
+
+# Reset test connectivity log (useful before starting a phase)
+reset_test_log() {
+    log_info "Resetting test connectivity log..."
+
+    local client_pod=$(kubectl get pod -n "$TEST_NAMESPACE" -l app=test-client -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+    if [ -z "$client_pod" ]; then
+        log_error "Test client pod not found"
+        exit 1
+    fi
+
+    kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- sh -c 'echo "Log reset at $(date -Iseconds)" > /shared/connectivity.log'
+
+    log_success "Connectivity log reset"
+}
+
 # Phase 1: Add Root B to trust store (still using Root A for signing)
 execute_phase1() {
     log_info "=========================================="
@@ -452,26 +692,38 @@ usage() {
     echo "Usage: $0 <command>"
     echo ""
     echo "Commands:"
-    echo "  prepare     - Check prerequisites and prepare certificates"
-    echo "  phase1      - Execute Phase 1: Add Root B to trust store"
-    echo "  phase2      - Execute Phase 2: Switch to Root B for signing"
-    echo "  phase3      - Execute Phase 3: Remove Root A from trust store"
-    echo "  verify      - Verify current certificate state"
-    echo "  rollback    - Rollback to original CA state"
-    echo "  all         - Execute all phases interactively"
+    echo "  prepare       - Check prerequisites and prepare certificates"
+    echo "  phase1        - Execute Phase 1: Add Root B to trust store"
+    echo "  phase2        - Execute Phase 2: Switch to Root B for signing"
+    echo "  phase3        - Execute Phase 3: Remove Root A from trust store"
+    echo "  verify        - Verify current certificate state"
+    echo "  rollback      - Rollback to original CA state"
+    echo "  all           - Execute all phases interactively"
+    echo ""
+    echo "Test Workload Commands:"
+    echo "  deploy-test   - Deploy test client/server workloads for connectivity testing"
+    echo "  test-status   - Check test workload connectivity status"
+    echo "  watch-test    - Watch test connectivity in real-time"
+    echo "  reset-test    - Reset connectivity log before a phase"
+    echo "  cleanup-test  - Remove test workloads"
     echo ""
     echo "Environment Variables:"
     echo "  WORK_DIR              - Working directory (default: ./cert-rotation-workspace)"
     echo "  ISTIO_NAMESPACE       - Istio namespace (default: istio-system)"
+    echo "  TEST_NAMESPACE        - Test workload namespace (default: cert-rotation-test)"
     echo "  CERT_VALIDITY_DAYS    - Root CA validity in days (default: 3650)"
     echo ""
     echo "Example workflow:"
-    echo "  1. $0 prepare    # Prepare certificates and backup"
-    echo "  2. $0 phase1     # Add new root to trust store"
-    echo "  3. # Wait and monitor"
-    echo "  4. $0 phase2     # Switch to new CA"
-    echo "  5. # Wait and monitor"
-    echo "  6. $0 phase3     # Remove old root"
+    echo "  1. $0 deploy-test  # Deploy test workloads"
+    echo "  2. $0 prepare      # Prepare certificates and backup"
+    echo "  3. $0 reset-test   # Reset connectivity log"
+    echo "  4. $0 phase1       # Add new root to trust store"
+    echo "  5. $0 test-status  # Check for any failures"
+    echo "  6. # Wait and monitor with: $0 watch-test"
+    echo "  7. $0 phase2       # Switch to new CA"
+    echo "  8. $0 test-status  # Check for any failures"
+    echo "  9. $0 phase3       # Remove old root"
+    echo " 10. $0 cleanup-test # Remove test workloads"
 }
 
 # Prepare certificates
@@ -592,6 +844,21 @@ case "${1:-}" in
         ;;
     all)
         execute_all
+        ;;
+    deploy-test)
+        deploy_test_workloads
+        ;;
+    test-status)
+        check_test_status
+        ;;
+    watch-test)
+        watch_test
+        ;;
+    reset-test)
+        reset_test_log
+        ;;
+    cleanup-test)
+        cleanup_test_workloads
         ;;
     *)
         usage
