@@ -352,14 +352,27 @@ spec:
     spec:
       containers:
       - name: server
-        image: curlimages/curl:latest
-        command: ["/bin/sh", "-c"]
+        image: python:3.12-alpine
+        command: ["python", "-c"]
         args:
         - |
-          # Simple HTTP server using netcat
-          while true; do
-            echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nServer: \$(hostname)\nTime: \$(date -Iseconds)\nStatus: OK" | nc -l -p 8080 -q 1 2>/dev/null || true
-          done
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          import socket
+          import datetime
+
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'text/plain')
+                  self.end_headers()
+                  response = f"Server: {socket.gethostname()}\nTime: {datetime.datetime.now().isoformat()}\nStatus: OK\n"
+                  self.wfile.write(response.encode())
+              def log_message(self, format, *args):
+                  pass  # Suppress logging
+
+          server = HTTPServer(('0.0.0.0', 8080), Handler)
+          print('Server running on port 8080')
+          server.serve_forever()
         ports:
         - containerPort: 8080
         volumeMounts:
@@ -368,10 +381,10 @@ spec:
         resources:
           requests:
             cpu: 10m
-            memory: 32Mi
+            memory: 64Mi
           limits:
             cpu: 100m
-            memory: 64Mi
+            memory: 128Mi
       volumes:
       - name: share
         emptyDir: {}
