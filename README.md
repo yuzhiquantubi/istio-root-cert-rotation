@@ -150,17 +150,17 @@ Before Phase 1:                    After Phase 1:
 - Still signing with Root A
 - No service disruption
 
-### Phase 2: Switch to Root B
+### Phase 2: Switch to New CA
 
 ```
 Before Phase 2:                    After Phase 2:
 ┌──────────────────┐              ┌──────────────────┐
 │ Signing CA: A    │              │ Signing CA: B    │  ← Changed
-│ Trust: A + B     │    ──────>   │ Trust: A + B + B │  ← Keep both
+│ Trust: A + B     │    ──────>   │ Trust: A + B     │  ← Keep both
 └──────────────────┘              └──────────────────┘
 ```
 
-- New certificates signed by Root B
+- New certificates signed by B (or Intermediate signed by B)
 - Old workloads still trusted (A in trust store)
 - New workloads trusted (B in trust store)
 
@@ -170,7 +170,7 @@ Before Phase 2:                    After Phase 2:
 Before Phase 3:                    After Phase 3:
 ┌──────────────────┐              ┌──────────────────┐
 │ Signing CA: B    │              │ Signing CA: B    │
-│ Trust: A + B + B │    ──────>   │ Trust: B         │  ← Removed A
+│ Trust: A + B     │    ──────>   │ Trust: B         │  ← Removed A
 └──────────────────┘              └──────────────────┘
 ```
 
@@ -530,12 +530,12 @@ With proper configuration, **there should be NO downtime**:
 
 **Why no downtime:** Existing certificates (signed by A) remain valid. Adding B to trust doesn't invalidate A.
 
-**Phase 2: Switch to Root B for Signing**
+**Phase 2: Switch to New CA for Signing**
 
 | Aspect | Before | After | Downtime? |
 |--------|--------|-------|-----------|
-| Trust Store | A + B | A + B + B | ❌ No |
-| Signing CA | A | B | - |
+| Trust Store | A + B | A + B | ❌ No |
+| Signing CA | A | B (or Intermediate signed by B) | - |
 | Old Certs | Signed by A | Signed by A | ✅ A still trusted |
 | New Certs | - | Signed by B | ✅ B already trusted |
 
@@ -545,7 +545,7 @@ With proper configuration, **there should be NO downtime**:
 
 | Aspect | Before | After | Downtime? |
 |--------|--------|-------|-----------|
-| Trust Store | A + B + B | B | ⚠️ Potential |
+| Trust Store | A + B | B | ⚠️ Potential |
 | Certs signed by A | Valid | **INVALID** | ⚠️ Risk |
 
 **Risk:** If any workload still has certs signed by A when you remove A → **Connection failures**
@@ -563,8 +563,8 @@ With proper configuration, **there should be NO downtime**:
 **No, staying in Phase 2 is safe.** Here's why:
 
 **Phase 2 State:**
-- Trust Store: A + B + B (both roots trusted)
-- Signing CA: B (new)
+- Trust Store: A + B (both roots trusted)
+- Signing CA: B (or Intermediate signed by B)
 - Old workloads: certs signed by A → Still valid (A trusted)
 - New workloads: certs signed by B → Valid (B trusted)
 
@@ -604,7 +604,7 @@ After ~24 hours in Phase 2, all workloads will have certs signed by B, even with
 ```
 Phase 2 State:
 ┌─────────────────────────────────┐
-│ Trust Store: A + B + B          │
+│ Trust Store: A + B              │
 │ Signing CA: B                   │
 │                                 │
 │ Old workloads: cert signed by A │ ← Still works (A trusted)
@@ -677,7 +677,7 @@ Both signed by A, A is trusted → ✅ Works
 Restarted workload ←→ Non-restarted workload
 (cert: B)              (cert: A)
      ↓                      ↓
-Trust store has A + B + B → ✅ Both directions work
+Trust store has A + B → ✅ Both directions work
 ```
 
 | Scenario | Client Cert | Server Cert | Result |
