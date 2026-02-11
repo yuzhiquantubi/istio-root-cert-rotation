@@ -8,14 +8,32 @@ Based on:
 
 ## Overview
 
-This tool implements a **four-phase approach** to rotate Istio root certificates without service disruption:
+This tool implements a **three-phase approach** to rotate Istio root certificates without service disruption.
+
+### Simple Rotation (Single Cluster, Root CA to Root CA)
 
 | Phase | ca-cert.pem | ca-key.pem | root-cert.pem | cert-chain.pem | Description |
 |-------|-------------|------------|---------------|----------------|-------------|
-| Initial | A | A | A | A | Current state |
-| Phase 1 | A | A | **A+B** | A | Add new root to trust store |
-| Phase 2 | **B** | **B** | **A+B+B** | **B** | Switch to new CA for signing |
-| Phase 3 | B | B | **B** | B | Remove old root |
+| Initial | Root-A | Root-A | Root-A | Root-A | Current state (self-signed) |
+| Phase 1 | Root-A | Root-A | **Root-A + Root-B** | Root-A | Add new root to trust store |
+| Phase 2 | **Root-B** | **Root-B** | **Root-A + Root-B** | **Root-B** | Switch to new root for signing |
+| Phase 3 | Root-B | Root-B | **Root-B** | Root-B | Remove old root |
+
+### Multi-Cluster Rotation (Self-signed to Shared Root with Intermediate CAs)
+
+For multi-cluster setups where you migrate from self-signed to a shared root CA with intermediate CAs:
+
+| Phase | ca-cert.pem | ca-key.pem | root-cert.pem | cert-chain.pem | Description |
+|-------|-------------|------------|---------------|----------------|-------------|
+| Initial | Root-A | Root-A | Root-A | Root-A | Self-signed CA |
+| Phase 1 | Root-A | Root-A | **Root-A + Shared-Root** | Root-A | Add shared root to trust |
+| Phase 2 | **Intermediate-A** | **Intermediate-A** | **Root-A + Shared-Root** | **Intermediate-A** | Switch to intermediate CA |
+| Phase 3 | Intermediate-A | Intermediate-A | **Shared-Root** | Intermediate-A | Remove old self-signed root |
+
+Where:
+- **Root-A**: Original self-signed CA
+- **Shared-Root**: New shared root CA (trusted by all clusters)
+- **Intermediate-A**: ClusterA's intermediate CA (signed by Shared-Root)
 
 ## Prerequisites
 
