@@ -679,7 +679,7 @@ Trust store has ONLY B → ❌ A is NOT trusted!
 | Scenario | Client Cert | Server Cert | Result |
 |----------|-------------|-------------|--------|
 | Restarted → Not restarted | B | A | ❌ FAIL (A not trusted) |
-| Not restarted → Restarted | A | B | ⚠️ May fail |
+| Not restarted → Restarted | A | B | ❌ FAIL (A not trusted) |
 
 **Summary Table:**
 
