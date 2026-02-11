@@ -10,7 +10,9 @@ Based on:
 
 This tool implements a **three-phase approach** to rotate Istio root certificates without service disruption.
 
-### Simple Rotation (Single Cluster, Root CA to Root CA)
+### Simple Rotation (Conceptual - Root CA to Root CA)
+
+> **Note:** This table shows a conceptual simple rotation. This script implements the Multi-Cluster approach below (using Intermediate CAs), which is the recommended approach for production.
 
 | Phase | ca-cert.pem | ca-key.pem | root-cert.pem | cert-chain.pem | Description |
 |-------|-------------|------------|---------------|----------------|-------------|
@@ -19,7 +21,7 @@ This tool implements a **three-phase approach** to rotate Istio root certificate
 | Phase 2 | **Root-B** | **Root-B** | **Root-A + Root-B** | **Root-B** | Switch to new root for signing |
 | Phase 3 | Root-B | Root-B | **Root-B** | Root-B | Remove old root |
 
-### Multi-Cluster Rotation (Self-signed to Shared Root with Intermediate CAs)
+### Multi-Cluster Rotation (What This Script Implements)
 
 For multi-cluster setups where you migrate from self-signed to a shared root CA with intermediate CAs:
 
@@ -106,8 +108,8 @@ spec:
 | Command | Description |
 |---------|-------------|
 | `prepare` | Check prerequisites, extract current certs, generate new certs, create backup |
-| `phase1` | Add Root B to trust store (still signing with Root A) |
-| `phase2` | Switch to Root B for signing (maintain dual root trust) |
+| `phase1` | Add new root to trust store (still signing with Root A) |
+| `phase2` | Switch to Intermediate CA for signing (maintain dual root trust) |
 | `phase3` | Remove Root A from trust store |
 | `verify` | Verify current certificate state |
 | `rollback` | Rollback to original CA state |

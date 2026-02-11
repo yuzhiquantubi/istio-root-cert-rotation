@@ -788,10 +788,10 @@ verify_phase_complete() {
     return 0
 }
 
-# Phase 1: Add Root B to trust store (still using Root A for signing)
+# Phase 1: Add new root to trust store (still using Root A for signing)
 execute_phase1() {
     log_info "=========================================="
-    log_info "PHASE 1: Add Root B to trust store"
+    log_info "PHASE 1: Add new root to trust store"
     log_info "=========================================="
     log_info "This phase adds the new root certificate to the trust store"
     log_info "while still using the old CA for signing workload certificates."
@@ -840,10 +840,10 @@ execute_phase1() {
     log_warning "2. Restart some workloads and verify they also work (new certificates)"
 }
 
-# Phase 2: Switch to Root B for signing (maintain dual root trust)
+# Phase 2: Switch to Intermediate CA for signing (maintain dual root trust)
 execute_phase2() {
     log_info "=========================================="
-    log_info "PHASE 2: Switch to Root B for signing"
+    log_info "PHASE 2: Switch to Intermediate CA for signing"
     log_info "=========================================="
     log_info "This phase switches to the new CA for signing while"
     log_info "maintaining trust for both old and new root certificates."
@@ -981,8 +981,8 @@ usage() {
     echo ""
     echo "Commands:"
     echo "  prepare       - Check prerequisites and prepare certificates"
-    echo "  phase1        - Execute Phase 1: Add Root B to trust store"
-    echo "  phase2        - Execute Phase 2: Switch to Root B for signing"
+    echo "  phase1        - Execute Phase 1: Add new root to trust store"
+    echo "  phase2        - Execute Phase 2: Switch to Intermediate CA for signing"
     echo "  phase3        - Execute Phase 3: Remove Root A from trust store"
     echo "  verify        - Verify current certificate state"
     echo "  rollback      - Rollback to original CA state"
