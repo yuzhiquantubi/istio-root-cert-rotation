@@ -189,7 +189,7 @@ The script includes test workloads to validate zero-downtime during certificate 
 │                                                             │
 │   ┌─────────────┐         HTTP/mTLS        ┌─────────────┐  │
 │   │ test-client │ ───────────────────────> │ test-server │  │
-│   │  (1 replica)│    every 1 second        │ (2 replicas)│  │
+│   │  (1 replica)│    every 1 second        │ (1 replica) │  │
 │   └─────────────┘                          └─────────────┘  │
 │         │                                                   │
 │         │ writes to                                         │
@@ -306,7 +306,7 @@ kubectl logs -n istio-system deployment/istiod | grep -i "cert\|root\|ca"
 
 ### Workloads not getting new certificates
 
-By default, Istio rotates workload certificates every 12 hours. You can:
+By default, Istio rotates workload certificates every 24 hours. You can:
 1. Wait for natural rotation
 2. Restart specific deployments to force new certificates
 
