@@ -335,8 +335,7 @@ cert-rotation-workspace/
 │       ├── ca-key.pem          # New intermediate key
 │       ├── root-cert.pem       # Copy of new root
 │       └── cert-chain.pem      # New certificate chain
-├── combined-root.pem           # Root A + Root B
-└── combined-root2.pem          # Root A + Root B + Root B
+└── combined-root.pem           # Root A + Root B (used for Phase 1 and Phase 2)
 ```
 
 ## FAQ - Frequently Asked Questions

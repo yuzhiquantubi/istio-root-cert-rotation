@@ -231,13 +231,10 @@ EOF
 create_combined_roots() {
     log_info "Creating combined root certificate files..."
 
-    # combined-root.pem = Root A + Root B
+    # combined-root.pem = Root A + Root B (used for Phase 1 and Phase 2)
     cat "$WORK_DIR/rootA/root-cert.pem" "$WORK_DIR/rootB/root-cert.pem" > "$WORK_DIR/combined-root.pem"
 
-    # combined-root2.pem = Root A + Root B + Root B (for transition phase)
-    cat "$WORK_DIR/rootA/root-cert.pem" "$WORK_DIR/rootB/root-cert.pem" "$WORK_DIR/rootB/root-cert.pem" > "$WORK_DIR/combined-root2.pem"
-
-    log_success "Created combined root certificate files"
+    log_success "Created combined root certificate file"
 
     # Verify combined certificates
     log_info "Combined root (A+B) contains:"
@@ -860,7 +857,7 @@ execute_phase2() {
     kubectl create secret generic cacerts -n "$ISTIO_NAMESPACE" \
         --from-file=ca-cert.pem="$WORK_DIR/rootB/intermediateB/ca-cert.pem" \
         --from-file=ca-key.pem="$WORK_DIR/rootB/intermediateB/ca-key.pem" \
-        --from-file=root-cert.pem="$WORK_DIR/combined-root2.pem" \
+        --from-file=root-cert.pem="$WORK_DIR/combined-root.pem" \
         --from-file=cert-chain.pem="$WORK_DIR/rootB/intermediateB/cert-chain.pem"
 
     log_success "Phase 2 completed at $(date -u)"
@@ -1084,10 +1081,14 @@ verify() {
             echo "  Phase: Initial (before rotation) or Phase 3 (after rotation)"
         elif [ "$root_cert_count" -eq 2 ]; then
             echo "  State: Two root certificates (A + B)"
-            echo "  Phase: Phase 1 (new root added to trust)"
-        elif [ "$root_cert_count" -eq 3 ]; then
-            echo "  State: Three root certificates (A + B + B)"
-            echo "  Phase: Phase 2 (switched to new CA)"
+            # Check if signing CA is root (Phase 1) or intermediate (Phase 2)
+            local ca_cert_cn=$(kubectl get secret cacerts -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['ca-cert\.pem']}" | \
+                base64 -d | openssl x509 -noout -subject 2>/dev/null | grep -o "CN = [^,]*" || echo "")
+            if echo "$ca_cert_cn" | grep -qi "intermediate"; then
+                echo "  Phase: Phase 2 (switched to intermediate CA, trust still includes A + B)"
+            else
+                echo "  Phase: Phase 1 (new root added to trust, still signing with old CA)"
+            fi
         else
             echo "  State: $root_cert_count root certificates"
         fi
