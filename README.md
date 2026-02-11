@@ -327,15 +327,47 @@ cert-rotation-workspace/
 
 #### Q: After Phase 1, will Istio multi-cluster feature work?
 
-**Yes**, multi-cluster will continue to work after Phase 1, but with important considerations:
+**It depends on the scenario:**
 
-**After Phase 1 State:**
-- Trust store: Contains Root A + Root B (combined)
-- Signing CA: Still Root A (unchanged)
-- Workload certs: Still signed by Root A
+**Scenario 1: New cluster joining (ClusterB is new with shared Root CA)**
 
-**Single Cluster Updated:**
-If only one cluster in your multi-cluster setup is updated to Phase 1, it still works because signing is done with Root A, and all clusters trust Root A.
+**No**, multi-cluster will NOT work after Phase 1.
+
+After Phase 1 on ClusterA:
+- ClusterA trust store: Old Root A + New shared Root B
+- ClusterA signing CA: Still Old Root A
+- ClusterA workload certs: Still signed by Old Root A
+
+ClusterB (new cluster with shared root):
+- ClusterB trust store: Only shared Root B
+- ClusterB signing CA: Shared Root B
+- ClusterB workload certs: Signed by shared Root B
+
+```
+ClusterA (phase1)           ClusterB (new, shared root)
+┌─────────────────┐         ┌─────────────────┐
+│ Trust: A + B    │         │ Trust: B only   │
+│ Signs with: A   │         │ Signs with: B   │
+└─────────────────┘         └─────────────────┘
+         ↓                           ↓
+    Certs signed by A          Certs signed by B
+         ↓                           ↓
+    Trusted by A ✓             Trusted by B ✓
+    NOT trusted by B ❌        Trusted by A+B ✓
+
+ClusterA → ClusterB: ❌ FAILS (B doesn't trust A's certs)
+ClusterB → ClusterA: ✅ Works (A trusts B's certs)
+```
+
+**Multi-cluster works after Phase 2** when ClusterA starts signing with the shared Root B.
+
+---
+
+**Scenario 2: Existing multi-cluster (both clusters already share the same root)**
+
+**Yes**, multi-cluster continues to work after Phase 1.
+
+If both clusters already share the same root CA (Root A) and you're rotating to a new root (Root B):
 
 ```
 Cluster A (phase1)          Cluster B (not updated)
@@ -346,7 +378,7 @@ Cluster A (phase1)          Cluster B (not updated)
          ↓                           ↓
     Certs signed by A          Certs signed by A
          ↓                           ↓
-    Trusted by B ✓             Trusted by A+B ✓
+    Trusted by A ✓             Trusted by A ✓
 ```
 
 **Critical for Phase 2:** Before moving ANY cluster to Phase 2, ensure ALL clusters have completed Phase 1.
