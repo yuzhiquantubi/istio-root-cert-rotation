@@ -321,6 +321,362 @@ cert-rotation-workspace/
 └── combined-root2.pem          # Root A + Root B + Root B
 ```
 
+## FAQ - Frequently Asked Questions
+
+### Multi-Cluster Support
+
+#### Q: After Phase 1, will Istio multi-cluster feature work?
+
+**Yes**, multi-cluster will continue to work after Phase 1, but with important considerations:
+
+**After Phase 1 State:**
+- Trust store: Contains Root A + Root B (combined)
+- Signing CA: Still Root A (unchanged)
+- Workload certs: Still signed by Root A
+
+**Single Cluster Updated:**
+If only one cluster in your multi-cluster setup is updated to Phase 1, it still works because signing is done with Root A, and all clusters trust Root A.
+
+```
+Cluster A (phase1)          Cluster B (not updated)
+┌─────────────────┐         ┌─────────────────┐
+│ Trust: A + B    │         │ Trust: A        │
+│ Signs with: A   │  ←→     │ Signs with: A   │
+└─────────────────┘         └─────────────────┘
+         ↓                           ↓
+    Certs signed by A          Certs signed by A
+         ↓                           ↓
+    Trusted by B ✓             Trusted by A+B ✓
+```
+
+**Critical for Phase 2:** Before moving ANY cluster to Phase 2, ensure ALL clusters have completed Phase 1.
+
+---
+
+### Multi-Cluster Certificate Rotation
+
+#### Q: I have ClusterA with self-signed certs. I want to create ClusterB for multi-cluster. How do I rotate ClusterA?
+
+For multi-cluster setups, both clusters must share the same root CA. Here's the approach:
+
+**Architecture:**
+```
+                    ┌─────────────────────┐
+                    │   Shared Root CA    │
+                    │   (root-cert.pem)   │
+                    └──────────┬──────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                                 │
+              ▼                                 ▼
+    ┌─────────────────┐              ┌─────────────────┐
+    │  Intermediate   │              │  Intermediate   │
+    │   CA (ClusterA) │              │   CA (ClusterB) │
+    └────────┬────────┘              └────────┬────────┘
+             │                                │
+             ▼                                ▼
+    ┌─────────────────┐              ┌─────────────────┐
+    │    ClusterA     │    mTLS      │    ClusterB     │
+    │  (existing)     │◄────────────►│  (new)          │
+    └─────────────────┘              └─────────────────┘
+```
+
+**Step 1: Generate Shared Root CA and Intermediate CAs**
+
+```bash
+# Create workspace
+mkdir -p multi-cluster-certs && cd multi-cluster-certs
+
+# Generate shared root CA
+openssl genrsa -out root-key.pem 4096
+openssl req -new -x509 -days 3650 -key root-key.pem \
+    -out root-cert.pem \
+    -subj "/O=MyOrg/CN=Shared Root CA"
+
+# Generate intermediate CA for ClusterA
+mkdir -p clusterA
+openssl genrsa -out clusterA/ca-key.pem 4096
+openssl req -new -key clusterA/ca-key.pem \
+    -out clusterA/ca.csr \
+    -subj "/O=MyOrg/CN=ClusterA Intermediate CA"
+
+cat > ca-ext.conf <<EOF
+basicConstraints = critical, CA:TRUE, pathlen:0
+keyUsage = critical, digitalSignature, keyCertSign, cRLSign
+EOF
+
+openssl x509 -req -days 365 \
+    -in clusterA/ca.csr \
+    -CA root-cert.pem -CAkey root-key.pem \
+    -CAcreateserial \
+    -out clusterA/ca-cert.pem \
+    -extfile ca-ext.conf
+
+cp root-cert.pem clusterA/root-cert.pem
+cp clusterA/ca-cert.pem clusterA/cert-chain.pem
+
+# Generate intermediate CA for ClusterB (same process)
+mkdir -p clusterB
+openssl genrsa -out clusterB/ca-key.pem 4096
+openssl req -new -key clusterB/ca-key.pem \
+    -out clusterB/ca.csr \
+    -subj "/O=MyOrg/CN=ClusterB Intermediate CA"
+
+openssl x509 -req -days 365 \
+    -in clusterB/ca.csr \
+    -CA root-cert.pem -CAkey root-key.pem \
+    -CAcreateserial \
+    -out clusterB/ca-cert.pem \
+    -extfile ca-ext.conf
+
+cp root-cert.pem clusterB/root-cert.pem
+cp clusterB/ca-cert.pem clusterB/cert-chain.pem
+```
+
+**Step 2: Install ClusterB with New CA (Fresh Install)**
+
+```bash
+kubectl config use-context clusterB
+kubectl create namespace istio-system
+kubectl create secret generic cacerts -n istio-system \
+    --from-file=ca-cert.pem=clusterB/ca-cert.pem \
+    --from-file=ca-key.pem=clusterB/ca-key.pem \
+    --from-file=root-cert.pem=clusterB/root-cert.pem \
+    --from-file=cert-chain.pem=clusterB/cert-chain.pem
+
+# Install Istio with multi-root support
+istioctl install -f <istio-operator-config>
+```
+
+**Step 3: Rotate ClusterA Using This Script**
+
+Use the rotation script with pre-generated certificates for ClusterA.
+
+**Multi-Cluster Timeline:**
+
+| Step | ClusterA | ClusterB | Multi-Cluster Works? |
+|------|----------|----------|----------------------|
+| Initial | Self-signed | Not installed | N/A |
+| Install ClusterB | Self-signed | Shared Root CA | ❌ No |
+| Phase 1 on ClusterA | Trust: Self-signed + Shared | Shared Root CA | ❌ No |
+| Phase 2 on ClusterA | Sign: Shared, Trust: Both | Shared Root CA | ✅ Yes! |
+| Phase 3 on ClusterA | Shared Root CA only | Shared Root CA | ✅ Yes |
+
+---
+
+### Downtime Risk Analysis
+
+#### Q: Is there any downtime during each phase?
+
+With proper configuration, **there should be NO downtime**:
+
+**Phase 1: Add Root B to Trust Store**
+
+| Aspect | Before | After | Downtime? |
+|--------|--------|-------|-----------|
+| Trust Store | A | A + B | ❌ No |
+| Signing CA | A | A | - |
+| Existing Certs | Signed by A | Signed by A | ✅ Still valid |
+
+**Why no downtime:** Existing certificates (signed by A) remain valid. Adding B to trust doesn't invalidate A.
+
+**Phase 2: Switch to Root B for Signing**
+
+| Aspect | Before | After | Downtime? |
+|--------|--------|-------|-----------|
+| Trust Store | A + B | A + B + B | ❌ No |
+| Signing CA | A | B | - |
+| Old Certs | Signed by A | Signed by A | ✅ A still trusted |
+| New Certs | - | Signed by B | ✅ B already trusted |
+
+**Why no downtime:** Both roots are trusted, so both old (A) and new (B) certificates work.
+
+**Phase 3: Remove Root A**
+
+| Aspect | Before | After | Downtime? |
+|--------|--------|-------|-----------|
+| Trust Store | A + B + B | B | ⚠️ Potential |
+| Certs signed by A | Valid | **INVALID** | ⚠️ Risk |
+
+**Risk:** If any workload still has certs signed by A when you remove A → **Connection failures**
+
+**Requirements for Zero-Downtime:**
+1. Istio must have `ISTIO_MULTIROOT_MESH: "true"` enabled
+2. Istio must have `PROXY_CONFIG_XDS_AGENT: "true"` enabled
+3. Sufficient time between phases for certificate propagation
+4. All workloads must have B-signed certs before Phase 3
+
+---
+
+#### Q: Is there any risk staying in Phase 2 for a long time?
+
+**No, staying in Phase 2 is safe.** Here's why:
+
+**Phase 2 State:**
+- Trust Store: A + B + B (both roots trusted)
+- Signing CA: B (new)
+- Old workloads: certs signed by A → Still valid (A trusted)
+- New workloads: certs signed by B → Valid (B trusted)
+
+**Automatic Certificate Rotation:**
+
+Istio automatically rotates workload certificates (default: every 24 hours):
+
+```
+Time 0 (Phase 2 starts):
+  Workload X: cert signed by A ✓ (A trusted)
+  Workload Y: cert signed by A ✓ (A trusted)
+
+Time +24h (natural rotation):
+  Workload X: cert signed by B ✓ (B trusted)
+  Workload Y: cert signed by B ✓ (B trusted)
+```
+
+After ~24 hours in Phase 2, all workloads will have certs signed by B, even without pod restarts.
+
+**Duration Safety:**
+
+| Duration in Phase 2 | Risk Level | Notes |
+|--------------------|------------|-------|
+| < 24 hours | ✅ No risk | Mixed A/B certs, both work |
+| 24h - 1 week | ✅ No risk | All certs should be B-signed |
+| 1 week - 1 month | ✅ Low risk | Safe, consider completing rotation |
+| > 1 month | ⚠️ Low risk | Unnecessary delay, complete Phase 3 |
+
+---
+
+### Workload Restart Strategy
+
+#### Q: In which phase should I rollout restart all workloads?
+
+**Recommended: After Phase 2, before Phase 3.**
+
+```
+Phase 2 State:
+┌─────────────────────────────────┐
+│ Trust Store: A + B + B          │
+│ Signing CA: B                   │
+│                                 │
+│ Old workloads: cert signed by A │ ← Still works (A trusted)
+│ New workloads: cert signed by B │ ← Works (B trusted)
+└─────────────────────────────────┘
+        │
+        │ Rollout restart here
+        ▼
+┌─────────────────────────────────┐
+│ ALL workloads: cert signed by B │ ← Safe to proceed to Phase 3
+└─────────────────────────────────┘
+        │
+        ▼
+Phase 3: Remove A from trust store → No impact
+```
+
+**Option 1: Immediate Restart (Recommended for Production)**
+
+```bash
+# After phase2, restart all workloads in Istio-injected namespaces
+for ns in $(kubectl get ns -l istio-injection=enabled -o name | cut -d/ -f2); do
+  echo "Restarting workloads in $ns..."
+  kubectl rollout restart deployment -n "$ns"
+done
+
+# Wait for all rollouts
+for ns in $(kubectl get ns -l istio-injection=enabled -o name | cut -d/ -f2); do
+  kubectl rollout status deployment -n "$ns" --timeout=300s
+done
+
+# Verify all have B-signed certs, then proceed to Phase 3
+./istio-root-cert-rotation.sh verify
+./istio-root-cert-rotation.sh phase3
+```
+
+**Option 2: Wait for Natural Rotation (Less Disruptive)**
+
+```bash
+# Stay in Phase 2 for 24+ hours
+# Istio automatically rotates workload certs
+
+# After 24h, verify and proceed
+./istio-root-cert-rotation.sh verify
+./istio-root-cert-rotation.sh phase3
+```
+
+---
+
+#### Q: Is there any risk when restarting workloads in each phase?
+
+**Phase 1 & 2: Safe to restart anytime. Phase 3: Verify first.**
+
+**Phase 1: Safe ✅**
+
+```
+Restarted workload ←→ Non-restarted workload
+(cert: A)              (cert: A)
+     ↓                      ↓
+Both signed by A, A is trusted → ✅ Works
+```
+
+| Scenario | Client Cert | Server Cert | Result |
+|----------|-------------|-------------|--------|
+| Restarted → Not restarted | A | A | ✅ OK |
+| Not restarted → Restarted | A | A | ✅ OK |
+
+**Phase 2: Safe ✅**
+
+```
+Restarted workload ←→ Non-restarted workload
+(cert: B)              (cert: A)
+     ↓                      ↓
+Trust store has A + B + B → ✅ Both directions work
+```
+
+| Scenario | Client Cert | Server Cert | Result |
+|----------|-------------|-------------|--------|
+| Restarted → Not restarted | B | A | ✅ OK (A trusted) |
+| Not restarted → Restarted | A | B | ✅ OK (B trusted) |
+
+**Phase 3: Risky ⚠️**
+
+```
+Restarted workload ←→ Non-restarted workload (if still has A cert)
+(cert: B)              (cert: A)
+     ↓                      ↓
+Trust store has ONLY B → ❌ A is NOT trusted!
+```
+
+| Scenario | Client Cert | Server Cert | Result |
+|----------|-------------|-------------|--------|
+| Restarted → Not restarted | B | A | ❌ FAIL (A not trusted) |
+| Not restarted → Restarted | A | B | ⚠️ May fail |
+
+**Summary Table:**
+
+| Phase | Restart Any Workloads | Mixed Cert Communication | Risk |
+|-------|----------------------|--------------------------|------|
+| Phase 1 | ✅ Safe | A ↔ A | None |
+| Phase 2 | ✅ Safe | A ↔ B, B ↔ A | None |
+| Phase 3 | ⚠️ Risky | B ↔ A fails | High (if A-certs exist) |
+
+**Pre-Phase 3 Verification:**
+
+```bash
+# Check all pods for cert issuer before Phase 3
+for ns in $(kubectl get ns -l istio-injection=enabled -o jsonpath='{.items[*].metadata.name}'); do
+  echo "=== Namespace: $ns ==="
+  for pod in $(kubectl get pods -n "$ns" -o jsonpath='{.items[*].metadata.name}'); do
+    issuer=$(istioctl pc secret "$pod.$ns" -ojson 2>/dev/null | \
+      jq -r '.dynamicActiveSecrets[0].secret.tlsCertificate.certificateChain.inlineBytes // empty' | \
+      base64 -d 2>/dev/null | \
+      step certificate inspect --short - 2>/dev/null | grep "Issuer:" | head -1)
+    echo "  $pod: $issuer"
+  done
+done
+```
+
+If any show old issuer (Root A), restart those workloads before Phase 3.
+
+---
+
 ## References
 
 - [Istio Security Documentation](https://istio.io/latest/docs/tasks/security/cert-management/plugin-ca-cert/)

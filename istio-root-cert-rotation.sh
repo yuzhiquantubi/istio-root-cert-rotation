@@ -359,19 +359,46 @@ spec:
           from http.server import HTTPServer, BaseHTTPRequestHandler
           import socket
           import datetime
+          import os
+
+          LOG_FILE = '/shared/server.log'
+          REQUEST_COUNT = [0]  # Use list for mutable counter
+
+          def write_log(msg):
+              with open(LOG_FILE, 'a') as f:
+                  f.write(msg + '\n')
+              print(msg, flush=True)
+              # Keep only last 1000 lines
+              if REQUEST_COUNT[0] % 100 == 0:
+                  try:
+                      with open(LOG_FILE, 'r') as f:
+                          lines = f.readlines()[-1000:]
+                      with open(LOG_FILE, 'w') as f:
+                          f.writelines(lines)
+                  except:
+                      pass
 
           class Handler(BaseHTTPRequestHandler):
               def do_GET(self):
+                  REQUEST_COUNT[0] += 1
+                  ts = datetime.datetime.now().isoformat()
+                  client_ip = self.client_address[0]
                   self.send_response(200)
                   self.send_header('Content-Type', 'text/plain')
                   self.end_headers()
-                  response = f"Server: {socket.gethostname()}\nTime: {datetime.datetime.now().isoformat()}\nStatus: OK\n"
+                  response = f"Server: {socket.gethostname()}\nTime: {ts}\nStatus: OK\n"
                   self.wfile.write(response.encode())
+                  write_log(f"[{ts}] REQUEST #{REQUEST_COUNT[0]} from {client_ip} - {self.requestline} - 200 OK")
+
               def log_message(self, format, *args):
-                  pass  # Suppress logging
+                  pass  # Use custom logging instead
+
+          # Initialize log file
+          with open(LOG_FILE, 'w') as f:
+              f.write(f"Server started at {datetime.datetime.now().isoformat()}\n")
 
           server = HTTPServer(('0.0.0.0', 8080), Handler)
-          print('Server running on port 8080')
+          print(f'Server running on port 8080, logging to {LOG_FILE}')
           server.serve_forever()
         ports:
         - containerPort: 8080
@@ -419,7 +446,13 @@ spec:
           RESP_FILE=/tmp/response.txt
           SUCCESS_COUNT=0
           FAIL_COUNT=0
-          echo "Starting connectivity test at \$(date -Iseconds)" > \$LOG_FILE
+
+          # Log to both file and stdout
+          log_msg() {
+            echo "\$1" | tee -a \$LOG_FILE
+          }
+
+          log_msg "Starting connectivity test at \$(date -Iseconds)"
           while true; do
             TIMESTAMP=\$(date -Iseconds)
             # Capture response body, HTTP code, and timing info
@@ -428,7 +461,7 @@ spec:
 
             if [ "\$HTTP_CODE" = "200" ] && [ "\$CURL_EXIT" -eq 0 ]; then
               SUCCESS_COUNT=\$((SUCCESS_COUNT + 1))
-              echo "[\$TIMESTAMP] SUCCESS (total: \$SUCCESS_COUNT, failed: \$FAIL_COUNT)" >> \$LOG_FILE
+              log_msg "[\$TIMESTAMP] SUCCESS (total: \$SUCCESS_COUNT, failed: \$FAIL_COUNT)"
             else
               FAIL_COUNT=\$((FAIL_COUNT + 1))
               # Collect detailed error info
@@ -440,16 +473,14 @@ spec:
               if [ -s \$RESP_FILE ]; then
                 RESP_BODY=\$(head -c 500 \$RESP_FILE | tr '\n' ' ')
               fi
-              # Log detailed failure info
-              echo "[\$TIMESTAMP] FAILED - HTTP:\$HTTP_CODE curl_exit:\$CURL_EXIT (total: \$SUCCESS_COUNT, failed: \$FAIL_COUNT)" >> \$LOG_FILE
+              # Log detailed failure info to both file and stdout
+              log_msg "[\$TIMESTAMP] FAILED - HTTP:\$HTTP_CODE curl_exit:\$CURL_EXIT (total: \$SUCCESS_COUNT, failed: \$FAIL_COUNT)"
               if [ -n "\$CURL_ERROR" ]; then
-                echo "  curl_error: \$CURL_ERROR" >> \$LOG_FILE
+                log_msg "  curl_error: \$CURL_ERROR"
               fi
               if [ -n "\$RESP_BODY" ]; then
-                echo "  response: \$RESP_BODY" >> \$LOG_FILE
+                log_msg "  response: \$RESP_BODY"
               fi
-              # Also print to stderr for kubectl logs
-              echo "[\$TIMESTAMP] FAILED - HTTP:\$HTTP_CODE curl_exit:\$CURL_EXIT error:\$CURL_ERROR body:\$RESP_BODY" >&2
             fi
             # Keep only last 1000 lines
             tail -1000 \$LOG_FILE > \$LOG_FILE.tmp && mv \$LOG_FILE.tmp \$LOG_FILE 2>/dev/null || true
@@ -528,6 +559,22 @@ check_test_status() {
 
     echo ""
 
+    # Show server logs
+    local server_pod=$(kubectl get pod -n "$TEST_NAMESPACE" -l app=test-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [ -n "$server_pod" ]; then
+        log_info "Server pod: $server_pod"
+        log_info "Recent server logs (last 10 entries):"
+        kubectl exec -n "$TEST_NAMESPACE" "$server_pod" -c server -- tail -10 /shared/server.log 2>/dev/null || \
+            log_warning "Could not read server log"
+        echo ""
+
+        local server_requests=$(kubectl exec -n "$TEST_NAMESPACE" "$server_pod" -c server -- grep -c "REQUEST" /shared/server.log 2>/dev/null | tr -d '[:space:]' || echo "0")
+        server_requests=${server_requests:-0}
+        echo "  Total server requests received: $server_requests"
+    fi
+
+    echo ""
+
     # Check workload certificates
     log_info "Test workload certificate info:"
     for app in test-client test-server; do
@@ -560,6 +607,25 @@ watch_test() {
     fi
 
     kubectl exec -n "$TEST_NAMESPACE" "$client_pod" -c client -- tail -f /shared/connectivity.log
+}
+
+# Watch server logs in real-time
+watch_server() {
+    log_info "Watching server logs in real-time (Ctrl+C to stop)..."
+
+    if ! kubectl get namespace "$TEST_NAMESPACE" &> /dev/null; then
+        log_error "Test namespace '$TEST_NAMESPACE' not found. Run '$0 deploy-test' first."
+        exit 1
+    fi
+
+    local server_pod=$(kubectl get pod -n "$TEST_NAMESPACE" -l app=test-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+    if [ -z "$server_pod" ]; then
+        log_error "Test server pod not found"
+        exit 1
+    fi
+
+    kubectl exec -n "$TEST_NAMESPACE" "$server_pod" -c server -- tail -f /shared/server.log
 }
 
 # Clean up test workloads
@@ -928,7 +994,8 @@ usage() {
     echo "Test Workload Commands:"
     echo "  deploy-test   - Deploy test client/server workloads for connectivity testing"
     echo "  test-status   - Check test workload connectivity status"
-    echo "  watch-test    - Watch test connectivity in real-time"
+    echo "  watch-test    - Watch client connectivity logs in real-time"
+    echo "  watch-server  - Watch server request logs in real-time"
     echo "  reset-test    - Reset connectivity log before a phase"
     echo "  verify-phase  - Verify OLD and NEW certs both work (with rollout restart)"
     echo "  cleanup-test  - Remove test workloads"
@@ -981,13 +1048,54 @@ verify() {
     log_info "Current Certificate State"
     log_info "=========================================="
 
-    log_info "CA Secret in $ISTIO_NAMESPACE:"
     if kubectl get secret cacerts -n "$ISTIO_NAMESPACE" &> /dev/null; then
-        echo "Using: cacerts (plugged-in CA)"
+        echo "CA Secret: cacerts (plugged-in CA)"
+        echo ""
+
+        # Count root certificates
+        local root_cert_count=$(kubectl get secret cacerts -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['root-cert\.pem']}" | \
+            base64 -d | grep -c "BEGIN CERTIFICATE" || echo "0")
+        log_info "Root certificates in trust store: $root_cert_count"
+
+        # Show each root certificate
+        echo ""
+        log_info "Root certificates (root-cert.pem) - Trust Store:"
         kubectl get secret cacerts -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['root-cert\.pem']}" | \
             base64 -d | step certificate inspect --short -
+
+        # Show signing CA
+        echo ""
+        log_info "Signing CA (ca-cert.pem) - Used to sign workload certs:"
+        kubectl get secret cacerts -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['ca-cert\.pem']}" | \
+            base64 -d | step certificate inspect --short -
+
+        # Show certificate chain
+        echo ""
+        log_info "Certificate chain (cert-chain.pem):"
+        local chain_count=$(kubectl get secret cacerts -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['cert-chain\.pem']}" | \
+            base64 -d | grep -c "BEGIN CERTIFICATE" || echo "0")
+        echo "  Certificates in chain: $chain_count"
+
+        # Determine current phase
+        echo ""
+        log_info "Current state analysis:"
+        if [ "$root_cert_count" -eq 1 ]; then
+            echo "  State: Single root certificate"
+            echo "  Phase: Initial (before rotation) or Phase 3 (after rotation)"
+        elif [ "$root_cert_count" -eq 2 ]; then
+            echo "  State: Two root certificates (A + B)"
+            echo "  Phase: Phase 1 (new root added to trust)"
+        elif [ "$root_cert_count" -eq 3 ]; then
+            echo "  State: Three root certificates (A + B + B)"
+            echo "  Phase: Phase 2 (switched to new CA)"
+        else
+            echo "  State: $root_cert_count root certificates"
+        fi
+
     elif kubectl get secret istio-ca-secret -n "$ISTIO_NAMESPACE" &> /dev/null; then
-        echo "Using: istio-ca-secret (self-signed CA)"
+        echo "CA Secret: istio-ca-secret (self-signed CA)"
+        echo ""
+        log_info "Self-signed CA certificate:"
         kubectl get secret istio-ca-secret -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['ca-cert\.pem']}" | \
             base64 -d | step certificate inspect --short -
     else
@@ -996,6 +1104,9 @@ verify() {
 
     echo ""
     log_info "Root cert in ConfigMap (distributed to workloads):"
+    local cm_cert_count=$(kubectl get cm istio-ca-root-cert -n default -o jsonpath="{.data['root-cert\.pem']}" 2>/dev/null | \
+        grep -c "BEGIN CERTIFICATE" || echo "0")
+    echo "  Certificates in ConfigMap: $cm_cert_count"
     kubectl get cm istio-ca-root-cert -n default -o jsonpath="{.data['root-cert\.pem']}" 2>/dev/null | \
         step certificate inspect --short - || log_warning "ConfigMap not found"
 }
@@ -1078,6 +1189,9 @@ case "${1:-}" in
         ;;
     watch-test)
         watch_test
+        ;;
+    watch-server)
+        watch_server
         ;;
     reset-test)
         reset_test_log
