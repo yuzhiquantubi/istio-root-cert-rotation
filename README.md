@@ -346,10 +346,6 @@ cert-rotation-workspace/
 
 #### Q: After Phase 1, will Istio multi-cluster feature work?
 
-**It depends on the scenario:**
-
-**Scenario 1: New cluster joining (ClusterB is new with shared Root CA)**
-
 **No**, multi-cluster will NOT work after Phase 1.
 
 After Phase 1 on ClusterA:
@@ -359,7 +355,7 @@ After Phase 1 on ClusterA:
 
 ClusterB (new cluster with shared root):
 - ClusterB trust store: Only shared Root B
-- ClusterB signing CA: Shared Root B
+- ClusterB signing CA: Shared Root B (via Intermediate)
 - ClusterB workload certs: Signed by shared Root B
 
 ```
@@ -382,33 +378,11 @@ ClusterB → ClusterA: ✅ Works (A trusts B's certs)
 
 ---
 
-**Scenario 2: Existing multi-cluster (both clusters already share the same root)**
-
-**Yes**, multi-cluster continues to work after Phase 1.
-
-If both clusters already share the same root CA (Root A) and you're rotating to a new root (Root B):
-
-```
-Cluster A (phase1)          Cluster B (not updated)
-┌─────────────────┐         ┌─────────────────┐
-│ Trust: A + B    │         │ Trust: A        │
-│ Signs with: A   │  ←→     │ Signs with: A   │
-└─────────────────┘         └─────────────────┘
-         ↓                           ↓
-    Certs signed by A          Certs signed by A
-         ↓                           ↓
-    Trusted by A ✓             Trusted by A ✓
-```
-
-**Critical for Phase 2:** Before moving ANY cluster to Phase 2, ensure ALL clusters have completed Phase 1.
-
----
-
 ### Multi-Cluster Certificate Rotation
 
 #### Q: I have ClusterA with self-signed certs. I want to create ClusterB for multi-cluster. How do I rotate ClusterA?
 
-For multi-cluster setups, both clusters must share the same root CA. Here's the approach:
+For multi-cluster setups, both clusters must share the same root CA. This script handles everything automatically.
 
 **Architecture:**
 ```
@@ -432,24 +406,43 @@ For multi-cluster setups, both clusters must share the same root CA. Here's the 
     └─────────────────┘              └─────────────────┘
 ```
 
-**Step 1: Generate Shared Root CA and Intermediate CAs**
+**Step 1: Run This Script on ClusterA**
+
+The script automatically generates the shared Root CA and Intermediate CA for ClusterA:
 
 ```bash
-# Create workspace
-mkdir -p multi-cluster-certs && cd multi-cluster-certs
+# Prepare certificates (generates shared Root CA + Intermediate for ClusterA)
+./istio-root-cert-rotation.sh prepare
 
-# Generate shared root CA
-openssl genrsa -out root-key.pem 4096
-openssl req -new -x509 -days 3650 -key root-key.pem \
-    -out root-cert.pem \
-    -subj "/O=MyOrg/CN=Shared Root CA"
+# Execute rotation phases
+./istio-root-cert-rotation.sh phase1
+./istio-root-cert-rotation.sh phase2
+./istio-root-cert-rotation.sh phase3
+```
 
-# Generate intermediate CA for ClusterA
-mkdir -p clusterA
-openssl genrsa -out clusterA/ca-key.pem 4096
-openssl req -new -key clusterA/ca-key.pem \
-    -out clusterA/ca.csr \
-    -subj "/O=MyOrg/CN=ClusterA Intermediate CA"
+After running `prepare`, the generated certificates are in:
+```
+cert-rotation-workspace/
+├── rootB/
+│   ├── root-cert.pem      ← Shared Root CA (save for ClusterB!)
+│   ├── root-key.pem       ← Root key (save securely for ClusterB!)
+│   └── intermediateB/     ← ClusterA's Intermediate CA
+```
+
+**Step 2: Later - Install ClusterB with Shared Root CA**
+
+Generate Intermediate CA for ClusterB using the saved shared Root CA:
+
+```bash
+# Use the shared root from ClusterA rotation
+SHARED_ROOT="cert-rotation-workspace/rootB"
+
+# Generate intermediate CA for ClusterB
+mkdir -p clusterB
+openssl genrsa -out clusterB/ca-key.pem 4096
+openssl req -new -key clusterB/ca-key.pem \
+    -out clusterB/ca.csr \
+    -subj "/O=Istio/CN=ClusterB Intermediate CA"
 
 cat > ca-ext.conf <<EOF
 basicConstraints = critical, CA:TRUE, pathlen:0
@@ -457,36 +450,17 @@ keyUsage = critical, digitalSignature, keyCertSign, cRLSign
 EOF
 
 openssl x509 -req -days 365 \
-    -in clusterA/ca.csr \
-    -CA root-cert.pem -CAkey root-key.pem \
-    -CAcreateserial \
-    -out clusterA/ca-cert.pem \
-    -extfile ca-ext.conf
-
-cp root-cert.pem clusterA/root-cert.pem
-cp clusterA/ca-cert.pem clusterA/cert-chain.pem
-
-# Generate intermediate CA for ClusterB (same process)
-mkdir -p clusterB
-openssl genrsa -out clusterB/ca-key.pem 4096
-openssl req -new -key clusterB/ca-key.pem \
-    -out clusterB/ca.csr \
-    -subj "/O=MyOrg/CN=ClusterB Intermediate CA"
-
-openssl x509 -req -days 365 \
     -in clusterB/ca.csr \
-    -CA root-cert.pem -CAkey root-key.pem \
+    -CA "$SHARED_ROOT/root-cert.pem" \
+    -CAkey "$SHARED_ROOT/root-key.pem" \
     -CAcreateserial \
     -out clusterB/ca-cert.pem \
     -extfile ca-ext.conf
 
-cp root-cert.pem clusterB/root-cert.pem
-cp clusterB/ca-cert.pem clusterB/cert-chain.pem
-```
+cp "$SHARED_ROOT/root-cert.pem" clusterB/root-cert.pem
+cat clusterB/ca-cert.pem "$SHARED_ROOT/root-cert.pem" > clusterB/cert-chain.pem
 
-**Step 2: Install ClusterB with New CA (Fresh Install)**
-
-```bash
+# Install on ClusterB
 kubectl config use-context clusterB
 kubectl create namespace istio-system
 kubectl create secret generic cacerts -n istio-system \
@@ -499,19 +473,17 @@ kubectl create secret generic cacerts -n istio-system \
 istioctl install -f <istio-operator-config>
 ```
 
-**Step 3: Rotate ClusterA Using This Script**
-
-Use the rotation script with pre-generated certificates for ClusterA.
-
 **Multi-Cluster Timeline:**
 
 | Step | ClusterA | ClusterB | Multi-Cluster Works? |
 |------|----------|----------|----------------------|
 | Initial | Self-signed | Not installed | N/A |
-| Install ClusterB | Self-signed | Shared Root CA | ❌ No |
-| Phase 1 on ClusterA | Trust: Self-signed + Shared | Shared Root CA | ❌ No |
-| Phase 2 on ClusterA | Sign: Shared, Trust: Both | Shared Root CA | ✅ Yes! |
-| Phase 3 on ClusterA | Shared Root CA only | Shared Root CA | ✅ Yes |
+| Phase 1 on ClusterA | Trust: Self-signed + Shared | Not installed | N/A |
+| Phase 2 on ClusterA | Sign: Shared, Trust: Both | Not installed | N/A |
+| Phase 3 on ClusterA | Shared Root CA only | Not installed | N/A |
+| Install ClusterB | Shared Root CA | Shared Root CA | ✅ Yes! |
+
+> **Note:** By completing ClusterA rotation before installing ClusterB, multi-cluster works immediately when ClusterB is installed.
 
 ---
 
