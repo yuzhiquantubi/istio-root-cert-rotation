@@ -284,7 +284,7 @@ verify_workload_certs() {
         istioctl pc secret "$pod.$namespace" -ojson 2>/dev/null | \
             jq -r '.dynamicActiveSecrets[0].secret.tlsCertificate.certificateChain.inlineBytes // empty' | \
             base64 -d 2>/dev/null | \
-            step certificate inspect --short - 2>/dev/null || log_warning "Could not inspect certificate for $pod"
+            step certificate inspect --short --bundle - 2>/dev/null || log_warning "Could not inspect certificate for $pod"
         break  # Only check first pod
     done
 }
@@ -581,7 +581,7 @@ check_test_status() {
             istioctl pc secret "$pod.$TEST_NAMESPACE" -ojson 2>/dev/null | \
                 jq -r '.dynamicActiveSecrets[0].secret.tlsCertificate.certificateChain.inlineBytes // empty' | \
                 base64 -d 2>/dev/null | \
-                step certificate inspect --short - 2>/dev/null | sed 's/^/    /' || \
+                step certificate inspect --short --bundle - 2>/dev/null | sed 's/^/    /' || \
                 echo "    Could not inspect certificate"
         fi
     done
@@ -698,7 +698,7 @@ verify_phase_complete() {
         istioctl pc secret "$pod.$TEST_NAMESPACE" -ojson 2>/dev/null | \
             jq -r '.dynamicActiveSecrets[0].secret.tlsCertificate.certificateChain.inlineBytes // empty' | \
             base64 -d 2>/dev/null | \
-            step certificate inspect --short - 2>/dev/null | sed 's/^/    /' || \
+            step certificate inspect --short --bundle - 2>/dev/null | sed 's/^/    /' || \
             echo "    Could not inspect certificate"
     }
 
@@ -819,7 +819,7 @@ execute_phase1() {
     # Verify
     log_info "Verifying root certificate in secret:"
     kubectl get secret cacerts -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['root-cert\.pem']}" | \
-        base64 -d | step certificate inspect --short -
+        base64 -d | step certificate inspect --short --bundle -
 
     log_success "Phase 1 secret update completed"
     echo ""
@@ -868,7 +868,7 @@ execute_phase2() {
     # Verify
     log_info "Verifying root certificate in secret:"
     kubectl get secret cacerts -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['root-cert\.pem']}" | \
-        base64 -d | step certificate inspect --short -
+        base64 -d | step certificate inspect --short --bundle -
 
     log_info "Checking istiod logs for certificate reload..."
     kubectl logs -n "$ISTIO_NAMESPACE" deployment/istiod --tail=20 | grep -i "cert\|root\|ca" || true
@@ -920,7 +920,7 @@ execute_phase3() {
     # Verify
     log_info "Verifying final root certificate in secret:"
     kubectl get secret cacerts -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['root-cert\.pem']}" | \
-        base64 -d | step certificate inspect --short -
+        base64 -d | step certificate inspect --short --bundle -
 
     log_success "Phase 3 secret update completed"
     echo ""
@@ -1058,13 +1058,13 @@ verify() {
         echo ""
         log_info "Root certificates (root-cert.pem) - Trust Store:"
         kubectl get secret cacerts -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['root-cert\.pem']}" | \
-            base64 -d | step certificate inspect --short -
+            base64 -d | step certificate inspect --short --bundle -
 
         # Show signing CA
         echo ""
         log_info "Signing CA (ca-cert.pem) - Used to sign workload certs:"
         kubectl get secret cacerts -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['ca-cert\.pem']}" | \
-            base64 -d | step certificate inspect --short -
+            base64 -d | step certificate inspect --short --bundle -
 
         # Show certificate chain
         echo ""
@@ -1098,7 +1098,7 @@ verify() {
         echo ""
         log_info "Self-signed CA certificate:"
         kubectl get secret istio-ca-secret -n "$ISTIO_NAMESPACE" -o jsonpath="{.data['ca-cert\.pem']}" | \
-            base64 -d | step certificate inspect --short -
+            base64 -d | step certificate inspect --short --bundle -
     else
         log_warning "No CA secret found"
     fi
@@ -1109,7 +1109,7 @@ verify() {
         grep -c "BEGIN CERTIFICATE" || echo "0")
     echo "  Certificates in ConfigMap: $cm_cert_count"
     kubectl get cm istio-ca-root-cert -n default -o jsonpath="{.data['root-cert\.pem']}" 2>/dev/null | \
-        step certificate inspect --short - || log_warning "ConfigMap not found"
+        step certificate inspect --short --bundle - || log_warning "ConfigMap not found"
 }
 
 # Execute all phases
